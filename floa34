@@ -1,0 +1,151 @@
+module float34_pipeline_fpu (
+    input  logic        clk,
+    input  logic        reset,
+    
+    input  logic [4:0]  opcode,       // 0:ADD, 1:SUB, 2:MUL, 3:DIV, 4:FMA, 5:SQRT, 6:CMP
+    input  logic [3:0]  addr_a,
+    input  logic [3:0]  addr_b,
+    input  logic [3:0]  addr_c,
+    input  logic [3:0]  addr_dest,
+    input  logic        write_en,
+    
+    input  logic [33:0] data_in,
+    input  logic        load_en,
+
+    output logic [33:0] out_data,
+    output logic        flag_nan,
+    output logic        flag_inf,
+    output logic        flag_zero,
+    output logic        cmp_out
+);
+
+    // ================= Константы =================
+    localparam [33:0] POS_INF = {1'b0, 9'h1FF, 24'h0};
+    localparam [33:0] NEG_INF = {1'b1, 9'h1FF, 24'h0};
+    localparam [33:0] NAN_IND = {1'b1, 9'h1FF, 24'h800000};
+
+    // ================= Регистровый файл =================
+    logic [33:0] rf [15:0];
+    logic [33:0] alu_out_stage5;
+
+    always_ff @(posedge clk or posedge reset) begin
+        if (reset) for (int i=0;i<16;i++) rf[i]<=34'b0;
+        else if (load_en) rf[addr_dest] <= data_in;
+        else if (write_en) rf[addr_dest] <= alu_out_stage5;
+    end
+
+    // ================= Stage 1: Fetch/Decode =================
+    logic [33:0] reg_a_s1, reg_b_s1, reg_c_s1;
+    logic [4:0]  opcode_s1;
+    logic [3:0]  addr_dest_s1;
+
+    always_ff @(posedge clk) begin
+        reg_a_s1 <= rf[addr_a];
+        reg_b_s1 <= rf[addr_b];
+        reg_c_s1 <= rf[addr_c];
+        opcode_s1 <= opcode;
+        addr_dest_s1 <= addr_dest;
+    end
+
+    // ================= Stage 2: Align Exponents =================
+    logic [24:0] m_a_s2, m_b_s2, m_c_s2;
+    logic [8:0] exp_s2;
+    logic sign_a_s2, sign_b_s2;
+
+    always_ff @(posedge clk) begin
+        m_a_s2 = (reg_a_s1[32:24]==0)?{1'b0,reg_a_s1[23:0]}:{1'b1,reg_a_s1[23:0]};
+        m_b_s2 = (reg_b_s1[32:24]==0)?{1'b0,reg_b_s1[23:0]}:{1'b1,reg_b_s1[23:0]};
+        m_c_s2 = (reg_c_s1[32:24]==0)?{1'b0,reg_c_s1[23:0]}:{1'b1,reg_c_s1[23:0]};
+        exp_s2 = (reg_a_s1[32:24]>=reg_b_s1[32:24])?reg_a_s1[32:24]:reg_b_s1[32:24];
+        sign_a_s2 = reg_a_s1[33];
+        sign_b_s2 = reg_b_s1[33];
+
+        // Выравнивание мантисс
+        if (reg_a_s1[32:24] > reg_b_s1[32:24])
+            m_b_s2 = m_b_s2 >> (reg_a_s1[32:24]-reg_b_s1[32:24]);
+        else
+            m_a_s2 = m_a_s2 >> (reg_b_s1[32:24]-reg_a_s1[32:24]);
+    end
+
+    // ================= Stage 3: Execute =================
+    logic [24:0] result_m_s3;
+    logic [8:0] result_exp_s3;
+    logic result_sign_s3;
+
+    always_ff @(posedge clk) begin
+        result_exp_s3 = exp_s2;
+        case(opcode_s1)
+            5'h00: begin // ADD
+                if (sign_a_s2==sign_b_s2) result_m_s3 = m_a_s2 + m_b_s2;
+                else if (m_a_s2>=m_b_s2) begin result_m_s3 = m_a_s2 - m_b_s2; result_sign_s3 = sign_a_s2; end
+                else begin result_m_s3 = m_b_s2 - m_a_s2; result_sign_s3 = sign_b_s2; end
+            end
+            5'h01: begin // SUB
+                // Инвертируем знак B и делаем как ADD
+                if (sign_a_s2!=sign_b_s2) result_m_s3 = m_a_s2 + m_b_s2;
+                else if (m_a_s2>=m_b_s2) begin result_m_s3 = m_a_s2 - m_b_s2; result_sign_s3 = sign_a_s2; end
+                else begin result_m_s3 = m_b_s2 - m_a_s2; result_sign_s3 = ~sign_b_s2; end
+            end
+            5'h02: begin // MUL
+                result_m_s3 = (m_a_s2*m_b_s2)>>23;
+                result_sign_s3 = sign_a_s2 ^ sign_b_s2;
+            end
+            5'h03: begin // DIV
+                if (m_b_s2==0) begin
+                    if (m_a_s2==0) result_m_s3 = NAN_IND[23:0]; // NaN
+                    else result_m_s3 = (sign_a_s2^sign_b_s2)?NEG_INF[23:0]:POS_INF[23:0];
+                end else begin
+                    result_m_s3 = (m_a_s2<<23)/m_b_s2;
+                    result_sign_s3 = sign_a_s2 ^ sign_b_s2;
+                end
+            end
+            5'h04: begin // FMA
+                result_m_s3 = ((m_a_s2*m_b_s2)>>23)+m_c_s2;
+                result_sign_s3 = sign_a_s2 ^ sign_b_s2;
+            end
+            5'h06: begin // CMP
+                result_m_s3 = (reg_a_s1==reg_b_s1)?25'd1:25'd0;
+            end
+            default: result_m_s3 = m_a_s2;
+        endcase
+    end
+
+    // ================= Stage 4: Normalize =================
+    logic [24:0] result_m_s4;
+    logic [8:0] result_exp_s4;
+    logic result_sign_s4;
+
+    always_ff @(posedge clk) begin
+        result_m_s4 = result_m_s3;
+        result_exp_s4 = result_exp_s3;
+        result_sign_s4 = result_sign_s3;
+
+        if (result_m_s4==0) result_exp_s4 = 0;
+        else if (result_m_s4[24]==1) begin
+            result_m_s4 = result_m_s4 >> 1;
+            result_exp_s4 = result_exp_s4 +1;
+        end else begin
+            while (result_m_s4[23]==0 && result_m_s4!=0) begin
+                result_m_s4 = result_m_s4 <<1;
+                result_exp_s4 = result_exp_s4 -1;
+            end
+        end
+
+        // Простейшее округление
+        if (result_m_s4[0]==1) result_m_s4 = result_m_s4+1;
+    end
+
+    // ================= Stage 5: Writeback =================
+    always_ff @(posedge clk) begin
+        alu_out_stage5 <= {result_sign_s4, result_exp_s4, result_m_s4[23:0]};
+    end
+
+    assign out_data = alu_out_stage5;
+
+    // ================= Флаги =================
+    assign flag_nan = (alu_out_stage5[32:24]==9'h1FF && alu_out_stage5[23:0]!=0);
+    assign flag_inf = (alu_out_stage5[32:24]==9'h1FF && alu_out_stage5[23:0]==0);
+    assign flag_zero = (alu_out_stage5[32:0]==0);
+    assign cmp_out = (opcode==5'h06)?alu_out_stage5[0]:0;
+
+endmodule
